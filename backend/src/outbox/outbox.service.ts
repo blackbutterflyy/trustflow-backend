@@ -226,6 +226,38 @@ export class OutboxService {
   }
 
   /**
+   * Purges delivered events older than `maxAgeSeconds`, measuring age from `deliveredAt`
+   * rather than `createdAt` — a message that sat pending for a long time before finally
+   * delivering still gets the full retention window counted from delivery, not creation
+   * (#988).
+   *
+   * Only the in-memory fallback needs this sweep: the Redis-backed path already retires a
+   * delivered event's body via a TTL set in `markDelivered()` at the moment of delivery
+   * (`config.OUTBOX_DELIVERED_TTL_SECONDS`), which is inherently delivered-time-based and
+   * never consults `createdAt`.
+   */
+  async purgeDeliveredOutboxMessages(
+    maxAgeSeconds: number = config.OUTBOX_DELIVERED_TTL_SECONDS,
+  ): Promise<number> {
+    if (this.redis || maxAgeSeconds <= 0) return 0;
+
+    const cutoff = Date.now() - maxAgeSeconds * 1000;
+    let purged = 0;
+    for (const [id, event] of this.memory.entries()) {
+      if (event.status !== 'delivered' || !event.deliveredAt) continue;
+      if (new Date(event.deliveredAt).getTime() >= cutoff) continue;
+
+      this.memory.delete(id);
+      purged++;
+    }
+
+    if (purged > 0) {
+      this.logger.log(`purgeDeliveredOutboxMessages: purged ${purged} delivered event(s)`);
+    }
+    return purged;
+  }
+
+  /**
    * Increments the attempt counter and reschedules the event with exponential
    * backoff (capped at 30 s). Permanently fails the event once
    * `config.OUTBOX_MAX_ATTEMPTS` is reached.
